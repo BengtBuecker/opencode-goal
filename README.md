@@ -111,6 +111,35 @@ Agenten auffordert, weiter am Ziel zu arbeiten oder es selbst per
 | Env-Var | Default | Zweck |
 |---|---|---|
 | `GOAL_ENFORCER_MAX_NUDGES` | `8` | Max. Anzahl automatischer Fortsetzungen pro Session für dasselbe (unveränderte) Ziel, bevor das Plugin zur Vermeidung von Endlosschleifen von selbst aufhört. |
+| `GOAL_VERIFIER_MODEL` | *(nicht gesetzt = aus)* | `providerID/modelID` eines kleinen/günstigen, in OpenCode bereits konfigurierten Modells (z.B. `anthropic/claude-haiku-4-5`, `openai/gpt-5-mini`, `google/gemini-2.5-flash`). Ist diese Variable gesetzt, prüft **dieses separate Modell** jeden `complete`-Aufruf gegenteilig, bevor das Ziel wirklich als erledigt markiert wird. |
+| `GOAL_VERIFIER_TIMEOUT_MS` | `45000` | Max. Wartezeit auf die Antwort des Verifier-Modells, bevor der Check als fehlgeschlagen gilt (→ Fallback, siehe unten). |
+
+### Unabhängiger Completion-Verifier (optional)
+
+Standardmäßig entscheidet der Agent **selbst**, wann er `goal` mit
+`{ "action": "complete" }` aufruft — es gibt keine zweite Instanz, die das
+gegenprüft. Setzt du `GOAL_VERIFIER_MODEL`, ändert sich das:
+
+- `complete` verlangt dann zusätzlich ein `summary`-Feld: eine konkrete
+  Beschreibung, was gemacht wurde und wie es verifiziert wurde (Dateien,
+  Befehle, Testergebnisse — keine vagen Behauptungen).
+- Das Plugin startet daraufhin eine **kurzlebige, separate Session** mit
+  genau dem konfigurierten (kleinen) Modell, schickt ihr **nur** Zieltext +
+  Summary (nicht das ganze Transkript) und lässt sie mit exakt `DONE` oder
+  `CONTINUE` + einem Satz Begründung antworten.
+- **`DONE`** → Ziel wird wirklich auf `"status": "done"` gesetzt.
+- **`CONTINUE`** → Ziel bleibt `"active"`; der Agent bekommt die
+  Begründung des Verifiers direkt als Tool-Antwort zurück (noch in
+  derselben Runde, ohne auf die nächste Idle-Phase warten zu müssen) und
+  soll weiterarbeiten, bevor er `complete` erneut aufruft.
+- **Läuft der Verifier-Call selbst auf einen Fehler** (Modell falsch
+  konfiguriert, Provider down, Timeout) → das Ziel wird trotzdem als
+  erledigt akzeptiert, **exakt wie ohne Verifier** — nie blockierend.
+- Diese Prüfung läuft **ausschließlich beim `complete`-Aufruf**, nicht bei
+  jeder Idle-Phase — die normalen Fortsetzungs-Nudges (siehe oben) bleiben
+  unverändert und kosten keinen zusätzlichen Modellaufruf.
+- Kein zusätzlicher API-Key nötig: das Verifier-Modell muss lediglich als
+  Provider/Modell in deinem OpenCode bereits eingerichtet sein.
 
 ## Funktionsweise (kurz)
 
@@ -131,6 +160,12 @@ Agenten auffordert, weiter am Ziel zu arbeiten oder es selbst per
   Fortsetzungsnachricht in genau diese Session zu schicken.
 - Ein In-Memory-Zähler pro Session verhindert endlose Nudges, sobald
   `GOAL_ENFORCER_MAX_NUDGES` für ein unverändertes Ziel erreicht ist.
+- Falls `GOAL_VERIFIER_MODEL` gesetzt ist: `complete` erzeugt via
+  `client.session.create(...)` eine Kind-Session mit genau diesem Modell,
+  schickt ihr die Verifikationsfrage per `client.session.prompt(...)`,
+  pollt `client.session.messages(...)` bis eine stabile Antwort vorliegt
+  (oder das Timeout greift), und räumt die Kind-Session danach per
+  `client.session.abort(...)` wieder auf.
 
 ## Migration von der alten Version (Ziel pro Projekt)
 

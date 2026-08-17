@@ -52,7 +52,14 @@ string>" }`.
 Confirm the goal was set, then **immediately start working on it in this
 same turn** -- do not wait for another user message. Keep working until
 the goal is genuinely, verifiably done. Only then call `goal` with
-`{ "action": "complete" }`, and report completion to the user.
+`{ "action": "complete", "summary": "<concrete, specific account of what
+you did and how you verified it: files changed, commands run, test
+results -- not vague claims>" }`, and report completion to the user.
+
+If an independent verifier is configured, it may reject this call and
+tell you to keep working instead of marking the goal done -- if that
+happens, address what it flagged, then call `complete` again with an
+updated summary once it is genuinely finished.
 
 ## Rules for every branch
 
@@ -60,4 +67,8 @@ the goal is genuinely, verifiably done. Only then call `goal` with
   always take them from the tool's response.
 - Exactly one `goal` tool call per invocation of this command (plus,
   separately, one more `{ "action": "complete" }` call later once the work
-  from step 5 is actually finished).
+  from step 5 is actually finished -- possibly more than once if a
+  configured verifier rejects an earlier attempt).
+- Always include a concrete `summary` when calling `complete`, even if you
+  don't know whether a verifier is configured -- it's ignored when there
+  isn't one, and required when there is.
