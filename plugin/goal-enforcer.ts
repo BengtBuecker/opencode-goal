@@ -1,29 +1,30 @@
-import { existsSync, readFileSync } from "node:fs"
-import { join } from "node:path"
-import type { Plugin } from "@opencode-ai/plugin"
+import { dirname, join } from "node:path"
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { tool, type Plugin } from "@opencode-ai/plugin"
 
 /**
- * Global goal enforcer (installed under ~/.config/opencode/plugin/, applies
- * to every project).
+ * Global goal enforcer + `goal` tool (installed under ~/.config/opencode/plugin/,
+ * applies to every project).
  *
- * Reads the state file written by the global `/goal` command
- * (~/.config/opencode/command/goal.md) and, whenever a session goes idle
- * while the goal is "active", sends one continuation message into that same
- * session so the agent keeps working instead of stopping. Anything other
- * than "active" (paused / done / no file at all) is a no-op.
+ * Goals are scoped PER SESSION, not per project: each session gets its own
+ * state file at `<project>/.opencode/goal/<sessionID>.json`. Two sessions
+ * open in the same project therefore run two completely independent goals
+ * -- setting, pausing, or completing one never touches the other.
  *
- * The state file itself stays per-project: it is resolved relative to the
- * `directory` OpenCode hands the plugin at runtime (the project currently
- * open), i.e. `<project>/.opencode/goal-state.json`. Only the plugin code
- * and the command are shared globally; goals never leak between projects.
+ * - The `goal` tool (set/show/pause/resume/clear/complete) is what the
+ *   `/goal` command (~/.config/opencode/command/goal.md) calls. It reads
+ *   `context.sessionID`, which is the only reliable way to know "which
+ *   session is this" from inside a slash-command prompt -- a plain prompt
+ *   template has no way to introspect its own session id, so all state
+ *   access must go through this tool instead of ad hoc Read/Write calls.
+ * - The `event` hook listens for `session.idle` and, whenever that specific
+ *   session's own goal is "active", sends one continuation message back
+ *   into that same session so the agent keeps working instead of stopping.
  *
- * Loop protection: at most MAX_NUDGES continuations are sent per session
- * for the *same* goal (same goal text + start timestamp). Setting a new
- * goal, or pausing/resuming, is observed via the state file on every idle
- * event, so the counter only ever grows for one unchanged goal.
+ * Loop protection: at most MAX_NUDGES continuations are sent per session for
+ * the *same* goal (same goal text + start timestamp). Setting a new goal
+ * resets the budget; pausing/resuming an unchanged goal does not.
  */
-
-const GOAL_STATE_RELATIVE_PATH = [".opencode", "goal-state.json"] as const
 
 const DEFAULT_MAX_NUDGES = 8
 
@@ -47,6 +48,10 @@ type NudgeRecord = {
   count: number
 }
 
+function goalFilePath(directory: string, sessionID: string): string {
+  return join(directory, ".opencode", "goal", `${encodeURIComponent(sessionID)}.json`)
+}
+
 function isGoalState(value: unknown): value is GoalState {
   if (typeof value !== "object" || value === null) return false
   const record = value as Record<string, unknown>
@@ -57,19 +62,31 @@ function isGoalState(value: unknown): value is GoalState {
   )
 }
 
-function readGoalState(directory: string): GoalState | null {
-  const filePath = join(directory, ...GOAL_STATE_RELATIVE_PATH)
+function readGoalState(filePath: string): GoalState | null {
   if (!existsSync(filePath)) return null
-
   try {
     const raw = readFileSync(filePath, "utf8")
     const parsed: unknown = JSON.parse(raw)
     return isGoalState(parsed) ? parsed : null
   } catch {
     // Malformed state file: treat exactly like "no goal" instead of throwing
-    // out of the event hook.
+    // out of a tool call or the idle hook.
     return null
   }
+}
+
+/** Atomic-ish write: write to a sibling temp file, then rename over the target. */
+function writeGoalState(filePath: string, state: GoalState): void {
+  mkdirSync(dirname(filePath), { recursive: true })
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`
+  writeFileSync(tmpPath, `${JSON.stringify(state, null, 2)}\n`, "utf8")
+  renameSync(tmpPath, filePath)
+}
+
+function deleteGoalState(filePath: string): boolean {
+  if (!existsSync(filePath)) return false
+  rmSync(filePath, { force: true })
+  return true
 }
 
 function buildContinuationPrompt(goal: GoalState): string {
@@ -83,9 +100,9 @@ function buildContinuationPrompt(goal: GoalState): string {
     `Started: ${goal.started}`,
     "",
     "Do not repeat work that is already finished. If the goal has genuinely",
-    "been achieved, update `.opencode/goal-state.json` yourself (keep `goal`",
-    'and `started` unchanged, set `"status": "done"`), then report completion',
-    "to the user instead of continuing.",
+    'been achieved, call the `goal` tool with `{ action: "complete" }` (do not',
+    "edit any file directly), then report completion to the user instead of",
+    "continuing.",
   ].join("\n")
 }
 
@@ -99,13 +116,70 @@ export const GoalEnforcerPlugin: Plugin = async ({ client, directory }) => {
   const inFlightSessions = new Set<string>()
 
   return {
+    tool: {
+      goal: tool({
+        description:
+          "Manage THIS session's own persistent goal (independent from other sessions in the same project). " +
+          "Actions: 'set' (requires 'text') starts/replaces the goal and activates idle-continuation nudges; " +
+          "'show' returns the current goal/status/started time, or that none exists; " +
+          "'pause' stops idle-continuation nudges without losing the goal; 'resume' re-activates it; " +
+          "'clear' deletes the goal entirely; 'complete' marks it done once the work is verifiably finished.",
+        args: {
+          action: tool.schema.enum(["set", "show", "pause", "resume", "clear", "complete"]),
+          text: tool.schema.string().optional(),
+        },
+        async execute(args, context) {
+          const filePath = goalFilePath(context.directory, context.sessionID)
+
+          if (args.action === "show") {
+            const goal = readGoalState(filePath)
+            return goal
+              ? `Goal: ${goal.goal}\nStatus: ${goal.status}\nStarted: ${goal.started}`
+              : "No goal set for this session."
+          }
+
+          if (args.action === "set") {
+            const text = args.text?.trim()
+            if (!text) throw new Error("action 'set' requires non-empty 'text'")
+            const state: GoalState = { goal: text, status: "active", started: new Date().toISOString() }
+            writeGoalState(filePath, state)
+            return `Goal set for this session: ${state.goal}`
+          }
+
+          const existing = readGoalState(filePath)
+
+          if (args.action === "pause") {
+            if (!existing) return "No active goal to pause for this session."
+            writeGoalState(filePath, { ...existing, status: "paused" })
+            return "Goal paused for this session. Idle-continuation nudges stopped."
+          }
+
+          if (args.action === "resume") {
+            if (!existing) return "No goal to resume for this session."
+            writeGoalState(filePath, { ...existing, status: "active" })
+            return "Goal resumed for this session."
+          }
+
+          if (args.action === "clear") {
+            const existed = deleteGoalState(filePath)
+            return existed ? "Goal cleared for this session." : "No goal existed for this session."
+          }
+
+          // args.action === "complete"
+          if (!existing) return "No goal to complete for this session."
+          writeGoalState(filePath, { ...existing, status: "done" })
+          return "Goal marked done for this session."
+        },
+      }),
+    },
+
     event: async ({ event }) => {
       if (event.type !== "session.idle") return
 
       const sessionID = (event.properties as { sessionID?: string } | undefined)?.sessionID
       if (!sessionID || inFlightSessions.has(sessionID)) return
 
-      const goal = readGoalState(directory)
+      const goal = readGoalState(goalFilePath(directory, sessionID))
       if (goal === null || goal.status !== "active") {
         // No goal, paused, or done: nothing to enforce. Drop any stale
         // counter so a future goal always starts with a clean budget.
