@@ -154,6 +154,10 @@ gegenprüft. Setzt du `GOAL_VERIFIER_MODEL`, ändert sich das:
 - Zustand: eine JSON-Datei **pro Session** unter
   `<projekt>/.opencode/goal/<sessionID>.json` mit
   `{ "goal": string, "status": "active"|"paused"|"done", "started": string }`.
+- Falls im Projekt bereits eine **Datei** namens `.opencode/goal` existiert,
+  bleibt sie unangetastet; das Plugin verwendet automatisch
+  `.opencode/goal-sessions/<sessionID>.json`, damit das Ziel trotzdem gesetzt
+  und abgeschlossen werden kann.
 - Das Plugin registriert ein Tool namens **`goal`** mit den Aktionen `set`,
   `show`, `pause`, `resume`, `clear`, `complete`. Nur dieses Tool liest/
   schreibt die Zustandsdatei — es kennt über `context.sessionID` und

@@ -1,5 +1,5 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { tool, type Plugin } from "@opencode-ai/plugin"
 
 /**
@@ -10,6 +10,8 @@ import { tool, type Plugin } from "@opencode-ai/plugin"
  * state file at `<project>/.opencode/goal/<sessionID>.json`. Two sessions
  * open in the same project therefore run two completely independent goals
  * -- setting, pausing, or completing one never touches the other.
+ * If a legacy or unrelated file already occupies `.opencode/goal`, state is
+ * stored under `.opencode/goal-sessions/<sessionID>.json` instead.
  *
  * - The `goal` tool (set/show/pause/resume/clear/complete) is what the
  *   `/goal` command (~/.config/opencode/command/goal.md) calls. It reads
@@ -41,6 +43,8 @@ import { tool, type Plugin } from "@opencode-ai/plugin"
 
 const DEFAULT_MAX_NUDGES = 8
 const DEFAULT_VERIFIER_TIMEOUT_MS = 45_000
+const GOAL_STATE_DIRECTORY = "goal"
+const GOAL_STATE_FALLBACK_DIRECTORY = "goal-sessions"
 
 /** Allows overriding the loop-protection ceiling without editing this file. */
 function resolveMaxNudges(): number {
@@ -107,8 +111,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
 
+function goalStateDirectory(directory: string): string {
+  const opencodeDirectory = join(directory, ".opencode")
+  const preferred = join(opencodeDirectory, GOAL_STATE_DIRECTORY)
+
+  if (!existsSync(preferred)) return preferred
+
+  try {
+    if (statSync(preferred).isDirectory()) return preferred
+  } catch {
+    // Use the fallback below if the preferred path cannot be inspected.
+  }
+
+  // A file named `.opencode/goal` is incompatible with the per-session
+  // directory layout. Preserve it and keep goal state in a separate folder.
+  return join(opencodeDirectory, GOAL_STATE_FALLBACK_DIRECTORY)
+}
+
 function goalFilePath(directory: string, sessionID: string): string {
-  return join(directory, ".opencode", "goal", `${encodeURIComponent(sessionID)}.json`)
+  return join(goalStateDirectory(directory), `${encodeURIComponent(sessionID)}.json`)
 }
 
 function isGoalState(value: unknown): value is GoalState {
@@ -135,7 +156,22 @@ function readGoalState(filePath: string): GoalState | null {
 
 /** Atomic-ish write: write to a sibling temp file, then rename over the target. */
 function writeGoalState(filePath: string, state: GoalState): void {
-  mkdirSync(dirname(filePath), { recursive: true })
+  const stateDirectory = dirname(filePath)
+  try {
+    mkdirSync(stateDirectory, { recursive: true })
+  } catch (error) {
+    // On Windows, a concurrent mkdir can still report EEXIST after another
+    // process has successfully created the directory. Accept that case, but
+    // keep real file/path collisions as errors.
+    if (!isRecord(error) || error["code"] !== "EEXIST") throw error
+    try {
+      if (statSync(stateDirectory).isDirectory()) return
+    } catch {
+      // Preserve the original mkdir error if the path disappeared or cannot
+      // be inspected after the race.
+    }
+    throw error
+  }
   const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`
   writeFileSync(tmpPath, `${JSON.stringify(state, null, 2)}\n`, "utf8")
   renameSync(tmpPath, filePath)
