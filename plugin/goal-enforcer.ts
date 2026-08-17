@@ -32,7 +32,8 @@ import { tool, type Plugin } from "@opencode-ai/plugin"
  * Only on a "DONE" verdict is the goal actually marked done; on "CONTINUE"
  * the status stays "active" and the tool tells the agent why. This never
  * runs on idle/nudge cycles -- only at the moment the agent itself claims
- * the goal is finished. If the verifier call itself fails for any reason
+ * the goal is finished. An optional GOAL_VERIFIER_FALLBACK_MODEL is tried if
+ * the primary model's verifier call fails. If every configured model fails
  * (misconfigured model, provider error, timeout), completion falls back to
  * being accepted without verification -- exactly like today's unverified
  * behavior, never blocking.
@@ -49,16 +50,38 @@ function resolveMaxNudges(): number {
 
 type VerifierModel = { readonly providerID: string; readonly modelID: string }
 
-/** Verifier is OFF by default. Set GOAL_VERIFIER_MODEL="providerID/modelID" to enable it. */
-function resolveVerifierModel(): VerifierModel | null {
-  const raw = process.env["GOAL_VERIFIER_MODEL"]
-  if (!raw) return null
+/** Parses "providerID/modelID"; logs and returns null on a malformed value. */
+function parseVerifierModelSpec(raw: string, envVarName: string): VerifierModel | null {
   const separatorIndex = raw.indexOf("/")
   if (separatorIndex <= 0 || separatorIndex === raw.length - 1) {
-    console.error(`[goal-enforcer] GOAL_VERIFIER_MODEL must look like "providerID/modelID", got: ${raw}`)
+    console.error(`[goal-enforcer] ${envVarName} must look like "providerID/modelID", got: ${raw}`)
     return null
   }
   return { providerID: raw.slice(0, separatorIndex), modelID: raw.slice(separatorIndex + 1) }
+}
+
+/**
+ * Verifier is OFF by default. Set GOAL_VERIFIER_MODEL="providerID/modelID" to enable it,
+ * and optionally GOAL_VERIFIER_FALLBACK_MODEL for a second model to try if the primary
+ * one fails (bad provider response, timeout, etc.). Returns the configured chain in
+ * order; empty means the feature is off.
+ */
+function resolveVerifierModels(): VerifierModel[] {
+  const primaryRaw = process.env["GOAL_VERIFIER_MODEL"]
+  if (!primaryRaw) return []
+
+  const primary = parseVerifierModelSpec(primaryRaw, "GOAL_VERIFIER_MODEL")
+  if (!primary) return []
+
+  const chain: VerifierModel[] = [primary]
+
+  const fallbackRaw = process.env["GOAL_VERIFIER_FALLBACK_MODEL"]
+  if (fallbackRaw) {
+    const fallback = parseVerifierModelSpec(fallbackRaw, "GOAL_VERIFIER_FALLBACK_MODEL")
+    if (fallback) chain.push(fallback)
+  }
+
+  return chain
 }
 
 function resolveVerifierTimeoutMs(): number {
@@ -257,7 +280,7 @@ type GoalClient = {
   }
 }
 
-/** Runs only when GOAL_VERIFIER_MODEL is configured; throws on any failure (caller decides the fallback). */
+/** Runs a single model; throws on any failure so the chain runner can fall through. */
 async function runGoalVerifier(
   client: GoalClient,
   model: VerifierModel,
@@ -297,9 +320,39 @@ async function runGoalVerifier(
   }
 }
 
+/**
+ * Tries each configured verifier model in order (primary, then fallback) and returns
+ * the first one that answers successfully. Only throws once every model in the chain
+ * has failed -- the caller then falls back to accepting completion unverified.
+ */
+async function runGoalVerifierChain(
+  client: GoalClient,
+  models: readonly VerifierModel[],
+  timeoutMs: number,
+  args: { directory: string; parentSessionID: string; goal: GoalState; summary: string },
+): Promise<{ verdict: "done" | "continue"; reasoning: string; usedModel: VerifierModel }> {
+  let lastError: unknown
+
+  for (const model of models) {
+    try {
+      const result = await runGoalVerifier(client, model, timeoutMs, args)
+      return { ...result, usedModel: model }
+    } catch (error) {
+      lastError = error
+      console.error(
+        `[goal-enforcer] verifier model ${model.providerID}/${model.modelID} failed` +
+          (model === models[models.length - 1] ? "" : "; trying next configured model"),
+        error,
+      )
+    }
+  }
+
+  throw lastError ?? new Error("goal verifier: no models configured")
+}
+
 export const GoalEnforcerPlugin: Plugin = async ({ client, directory }) => {
   const maxNudges = resolveMaxNudges()
-  const verifierModelAtStartup = resolveVerifierModel()
+  const verifierModelsAtStartup = resolveVerifierModels()
 
   // Per-session nudge bookkeeping, kept in memory for the plugin's lifetime.
   const nudgeCounters = new Map<string, NudgeRecord>()
@@ -318,7 +371,7 @@ export const GoalEnforcerPlugin: Plugin = async ({ client, directory }) => {
           "'show' returns the current goal/status/started time, or that none exists; " +
           "'pause' stops idle-continuation nudges without losing the goal; 'resume' re-activates it; " +
           "'clear' deletes the goal entirely; 'complete' marks it done once the work is verifiably finished." +
-          (verifierModelAtStartup
+          (verifierModelsAtStartup.length > 0
             ? " An independent verifier model is configured: 'complete' REQUIRES a concrete 'summary' " +
               "of what was done and how it was verified; a small separate model judges that summary " +
               "before the goal is actually marked done, and may reject it and ask you to keep working."
@@ -368,8 +421,8 @@ export const GoalEnforcerPlugin: Plugin = async ({ client, directory }) => {
           // args.action === "complete"
           if (!existing) return "No goal to complete for this session."
 
-          const verifierModel = resolveVerifierModel()
-          if (!verifierModel) {
+          const verifierModels = resolveVerifierModels()
+          if (verifierModels.length === 0) {
             writeGoalState(filePath, { ...existing, status: "done" })
             return "Goal marked done for this session."
           }
@@ -383,25 +436,26 @@ export const GoalEnforcerPlugin: Plugin = async ({ client, directory }) => {
           }
 
           try {
-            const { verdict, reasoning } = await runGoalVerifier(
+            const { verdict, reasoning, usedModel } = await runGoalVerifierChain(
               goalClient,
-              verifierModel,
+              verifierModels,
               resolveVerifierTimeoutMs(),
               { directory: context.directory, parentSessionID: context.sessionID, goal: existing, summary },
             )
+            const verifierLabel = `${usedModel.providerID}/${usedModel.modelID}`
 
             if (verdict === "done") {
               writeGoalState(filePath, { ...existing, status: "done" })
-              return `Goal verified and marked done for this session.\nVerifier: ${reasoning}`
+              return `Goal verified and marked done for this session.\nVerifier (${verifierLabel}): ${reasoning}`
             }
 
             return [
               "Verifier rejected this completion -- the goal is NOT marked done.",
-              `Verifier: ${reasoning}`,
+              `Verifier (${verifierLabel}): ${reasoning}`,
               'Keep working, then call the `goal` tool again with `{ "action": "complete", "summary": "..." }` once it is genuinely finished.',
             ].join("\n")
           } catch (error) {
-            console.error("[goal-enforcer] goal verifier failed; accepting completion without verification", error)
+            console.error("[goal-enforcer] all verifier models failed; accepting completion without verification", error)
             writeGoalState(filePath, { ...existing, status: "done" })
             return "Goal marked done for this session (verifier check failed, so completion was accepted without verification)."
           }

@@ -111,8 +111,9 @@ Agenten auffordert, weiter am Ziel zu arbeiten oder es selbst per
 | Env-Var | Default | Zweck |
 |---|---|---|
 | `GOAL_ENFORCER_MAX_NUDGES` | `8` | Max. Anzahl automatischer Fortsetzungen pro Session für dasselbe (unveränderte) Ziel, bevor das Plugin zur Vermeidung von Endlosschleifen von selbst aufhört. |
-| `GOAL_VERIFIER_MODEL` | *(nicht gesetzt = aus)* | `providerID/modelID` eines kleinen/günstigen, in OpenCode bereits konfigurierten Modells (z.B. `anthropic/claude-haiku-4-5`, `openai/gpt-5-mini`, `google/gemini-2.5-flash`). Ist diese Variable gesetzt, prüft **dieses separate Modell** jeden `complete`-Aufruf gegenteilig, bevor das Ziel wirklich als erledigt markiert wird. |
-| `GOAL_VERIFIER_TIMEOUT_MS` | `45000` | Max. Wartezeit auf die Antwort des Verifier-Modells, bevor der Check als fehlgeschlagen gilt (→ Fallback, siehe unten). |
+| `GOAL_VERIFIER_MODEL` | *(nicht gesetzt = aus)* | `providerID/modelID` eines kleinen/günstigen, in OpenCode bereits konfigurierten Modells (z.B. `openrouter/openai/gpt-5-nano`, `anthropic/claude-haiku-4-5`, `google/gemini-2.5-flash`). Ist diese Variable gesetzt, prüft **dieses separate Modell** jeden `complete`-Aufruf gegenteilig, bevor das Ziel wirklich als erledigt markiert wird. |
+| `GOAL_VERIFIER_FALLBACK_MODEL` | *(nicht gesetzt)* | Optionales zweites Modell (`providerID/modelID`) als **Rückfall**: Wenn der primäre Verifier-Call fehlschlägt (Provider-Fehler, Timeout, Modell nicht verfügbar), wird automatisch dieses Modell versucht, bevor die Prüfung als gescheitert gilt. Nur wirksam, wenn `GOAL_VERIFIER_MODEL` gesetzt ist. |
+| `GOAL_VERIFIER_TIMEOUT_MS` | `45000` | Max. Wartezeit auf die Antwort des Verifier-Modells, bevor der Check als fehlgeschlagen gilt (→ nächster Fallback, siehe unten). |
 
 ### Unabhängiger Completion-Verifier (optional)
 
@@ -133,8 +134,15 @@ gegenprüft. Setzt du `GOAL_VERIFIER_MODEL`, ändert sich das:
   derselben Runde, ohne auf die nächste Idle-Phase warten zu müssen) und
   soll weiterarbeiten, bevor er `complete` erneut aufruft.
 - **Läuft der Verifier-Call selbst auf einen Fehler** (Modell falsch
-  konfiguriert, Provider down, Timeout) → das Ziel wird trotzdem als
-  erledigt akzeptiert, **exakt wie ohne Verifier** — nie blockierend.
+  konfiguriert, Provider down, Timeout) und ist kein
+  `GOAL_VERIFIER_FALLBACK_MODEL` gesetzt (oder auch das scheitert) → das
+  Ziel wird trotzdem als erledigt akzeptiert, **exakt wie ohne Verifier** —
+  nie blockierend.
+- Der Fallback ist eine echte Kette: Primärmodell zuerst, bei dessen
+  Fehlschlag automatisch das Fallback-Modell. Nur wenn **alle** Modelle der
+  Kette scheitern, gilt der Check als gescheitert. Die Tool-Antwort nennt
+  jeweils, welches Modell geurteilt hat (z.B. `Verifier
+  (openrouter/openai/gpt-5-nano): DONE ...`).
 - Diese Prüfung läuft **ausschließlich beim `complete`-Aufruf**, nicht bei
   jeder Idle-Phase — die normalen Fortsetzungs-Nudges (siehe oben) bleiben
   unverändert und kosten keinen zusätzlichen Modellaufruf.
@@ -161,11 +169,13 @@ gegenprüft. Setzt du `GOAL_VERIFIER_MODEL`, ändert sich das:
 - Ein In-Memory-Zähler pro Session verhindert endlose Nudges, sobald
   `GOAL_ENFORCER_MAX_NUDGES` für ein unverändertes Ziel erreicht ist.
 - Falls `GOAL_VERIFIER_MODEL` gesetzt ist: `complete` erzeugt via
-  `client.session.create(...)` eine Kind-Session mit genau diesem Modell,
+  `client.session.create(...)` eine Kind-Session mit dem Primärmodell,
   schickt ihr die Verifikationsfrage per `client.session.prompt(...)`,
   pollt `client.session.messages(...)` bis eine stabile Antwort vorliegt
   (oder das Timeout greift), und räumt die Kind-Session danach per
-  `client.session.abort(...)` wieder auf.
+  `client.session.abort(...)` wieder auf. Scheitert das Primärmodell und
+  ist `GOAL_VERIFIER_FALLBACK_MODEL` gesetzt, wiederholt sich das Ganze
+  automatisch mit dem Fallback-Modell.
 
 ## Migration von der alten Version (Ziel pro Projekt)
 
